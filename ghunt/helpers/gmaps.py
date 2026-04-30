@@ -50,15 +50,46 @@ async def get_reviews(as_client: httpx.AsyncClient, gaia_id: str) -> Tuple[str, 
     stats = {}
 
     print("Getting statistics")
-    req = await as_client.get(f"https://www.google.com/locationhistory/preview/mas?authuser=0&hl=en&gl=us&pb={gb.config.templates['gmaps_pb']['stats'].format(gaia_id)}")
-    if req.status_code == 302 and req.headers["Location"].startswith("https://www.google.com/sorry/index"):
+    try:
+        req = await as_client.get(
+            f"https://www.google.com/locationhistory/preview/mas?authuser=0&hl=en&gl=us&pb={gb.config.templates['gmaps_pb']['stats'].format(gaia_id)}"
+        )
+    except httpx.HTTPError:
         return "failed", stats
 
-    data = json.loads(req.text[5:])
-    if not data[16][8]:
+    # Google may redirect to a "sorry" page when our IP is rate-limited/blocked.
+    if req.status_code in (301, 302) and req.headers.get("Location", "").startswith(
+        "https://www.google.com/sorry/index"
+    ):
+        return "failed", stats
+
+    # Any non-2xx response means we did not get a parsable payload.
+    if req.status_code >= 400:
+        return "failed", stats
+
+    # Google prepends ")]}'" to its JSON to prevent JSON hijacking.
+    # We must drop that prefix before decoding, but only if it is actually present.
+    body = req.text or ""
+    if body.startswith(")]}'"):
+        body = body.split("\n", 1)[-1] if "\n" in body else body[5:]
+
+    if not body.strip():
         return "empty", stats
-    stats = {sec[6]:sec[7] for sec in data[16][8][0]}
-    total_reviews = stats["Reviews"] + stats["Ratings"] + stats["Photos"]
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        # The endpoint occasionally returns HTML (consent pages, errors, etc.).
+        return "failed", stats
+
+    try:
+        if not data[16][8]:
+            return "empty", stats
+        stats = {sec[6]: sec[7] for sec in data[16][8][0]}
+        total_reviews = stats.get("Reviews", 0) + stats.get("Ratings", 0) + stats.get("Photos", 0)
+    except (IndexError, KeyError, TypeError):
+        return "empty", stats
+
     if not total_reviews:
         return "empty", stats
 
